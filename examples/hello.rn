@@ -1,0 +1,16 @@
+rite add(a int, b int) int
+{
+    ret a + b;
+}
+
+rite main() int
+{
+    let x int = 5;
+    mut y int = 10;
+    y = y + add(x, 1);
+    if (y > 10)
+    {
+        ret 1;
+    }
+    ret 0;
+}
