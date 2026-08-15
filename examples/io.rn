@@ -1,0 +1,9 @@
+extern rite puts(s char*) int;
+extern rite printf(fmt char*, ...) int;
+
+rite main() int
+{
+    puts("hello from rin");
+    printf("the answer is %d\n", 42);
+    ret 0;
+}

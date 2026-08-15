@@ -53,6 +53,7 @@ NewExpr(PPARSER P, EXPR_KIND Kind, int Line)
     PRIN_EXPR E = ArenaAlloc(P->Arena, sizeof(RIN_EXPR));
     E->Kind = Kind;
     E->Line = Line;
+    E->ResolvedType = NULL;
     return E;
 }
 
@@ -591,6 +592,10 @@ ParseFunction(PPARSER P)
     memset(&Fn, 0, sizeof(Fn));
     Fn.Line = P->Current.Line;
 
+    int IsExtern = 0;
+    if (Match(P, TOK_EXTERN))
+        IsExtern = 1;
+
     Advance(P); /* 'rite' */
 
     Expect(P, TOK_IDENT, "function name after 'rite'");
@@ -602,11 +607,20 @@ ParseFunction(PPARSER P)
     RIN_PARAM *Params = NULL;
     size_t ParamCount = 0;
     size_t ParamCap = 0;
+    int IsVariadic = 0;
 
     if (!Check(P, TOK_RPAREN))
     {
         do
         {
+            if (Match(P, TOK_ELLIPSIS))
+            {
+                if (!IsExtern)
+                    ReportError(P->Previous.Line, "'...' is only allowed in 'extern' declarations");
+                IsVariadic = 1;
+                break; /* '...' must be the last parameter */
+            }
+
             Expect(P, TOK_IDENT, "parameter name");
             const char *PName = P->Previous.Start;
             size_t PLength = P->Previous.Length;
@@ -634,8 +648,18 @@ ParseFunction(PPARSER P)
     Fn.ReturnType = ParseType(P);
     Fn.Params = Params;
     Fn.ParamCount = ParamCount;
+    Fn.IsExtern = IsExtern;
+    Fn.IsVariadic = IsVariadic;
 
-    Fn.Body = ParseBlock(P);
+    if (IsExtern)
+    {
+        Expect(P, TOK_SEMI, "';' after extern function declaration");
+        Fn.Body = NULL;
+    }
+    else
+    {
+        Fn.Body = ParseBlock(P);
+    }
 
     return Fn;
 }
@@ -657,9 +681,10 @@ ParseModule(const char *Source, size_t Length, PARENA Arena)
 
     while (!Check(&P, TOK_EOF))
     {
-        if (!Check(&P, TOK_RITE))
+        int LooksLikeExtern = Check(&P, TOK_EXTERN);
+        if (!Check(&P, TOK_RITE) && !LooksLikeExtern)
         {
-            ReportError(P.Current.Line, "expected 'rite' at top level");
+            ReportError(P.Current.Line, "expected 'rite' or 'extern' at top level");
             Advance(&P); /* avoid infinite loop */
             continue;
         }

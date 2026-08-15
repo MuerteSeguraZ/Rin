@@ -28,6 +28,7 @@ static const KEYWORD_ENTRY g_Keywords[] =
     { "for",    TOK_FOR },
     { "struct", TOK_STRUCT },
     { "import", TOK_IMPORT },
+    { "extern", TOK_EXTERN },
     { "true",   TOK_TRUE },
     { "false",  TOK_FALSE },
     { "int",    TOK_INT },
@@ -272,7 +273,14 @@ LexerNext(PLEXER Lexer)
         case ']': return MakeToken(Lexer, TOK_RBRACKET, Start, 1, Line);
         case ';': return MakeToken(Lexer, TOK_SEMI, Start, 1, Line);
         case ',': return MakeToken(Lexer, TOK_COMMA, Start, 1, Line);
-        case '.': return MakeToken(Lexer, TOK_DOT, Start, 1, Line);
+        case '.':
+            if (Peek(Lexer) == '.' && PeekNext(Lexer) == '.')
+            {
+                Advance(Lexer);
+                Advance(Lexer);
+                return MakeToken(Lexer, TOK_ELLIPSIS, Start, 3, Line);
+            }
+            return MakeToken(Lexer, TOK_DOT, Start, 1, Line);
         case '~': return MakeToken(Lexer, TOK_TILDE, Start, 1, Line);
         case '^': return MakeToken(Lexer, TOK_CARET, Start, 1, Line);
 

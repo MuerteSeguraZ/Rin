@@ -25,6 +25,7 @@ typedef struct
     RIN_PARAM *Params;
     size_t ParamCount;
     PRIN_TYPE ReturnType;
+    int IsVariadic;
 } FUNC_SIG;
 
 typedef struct
@@ -333,8 +334,13 @@ CheckExpr(PCHECKER C, PRIN_EXPR E)
 
             if (E->As.Call.ArgCount != Sig->ParamCount)
             {
-                ReportError(E->Line, "'%.*s' expects %zu argument(s), got %zu",
-                            (int)E->As.Call.Length, E->As.Call.Name, Sig->ParamCount, E->As.Call.ArgCount);
+                if (!(Sig->IsVariadic && E->As.Call.ArgCount >= Sig->ParamCount))
+                {
+                    ReportError(E->Line, "'%.*s' expects %s%zu argument(s), got %zu",
+                                (int)E->As.Call.Length, E->As.Call.Name,
+                                Sig->IsVariadic ? "at least " : "",
+                                Sig->ParamCount, E->As.Call.ArgCount);
+                }
             }
 
             size_t CheckCount = E->As.Call.ArgCount < Sig->ParamCount ? E->As.Call.ArgCount : Sig->ParamCount;
@@ -518,11 +524,15 @@ TypecheckModule(PRIN_MODULE Module, PARENA Arena)
         C.Funcs[i].Params = Fn->Params;
         C.Funcs[i].ParamCount = Fn->ParamCount;
         C.Funcs[i].ReturnType = Fn->ReturnType;
+        C.Funcs[i].IsVariadic = Fn->IsVariadic;
     }
 
     for (size_t i = 0; i < Module->FunctionCount; i++)
     {
         RIN_FUNCTION *Fn = &Module->Functions[i];
+
+        if (Fn->IsExtern)
+            continue; /* no body to check */
 
         PushScope(&C);
         C.CurrentReturnType = Fn->ReturnType;

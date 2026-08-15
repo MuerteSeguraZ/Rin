@@ -126,14 +126,14 @@ FreeVars(PGEN G)
     G->Vars = NULL;
 }
 
-static PRIN_TYPE
-FindFuncReturnType(PGEN G, const char *Name, size_t Length)
+static RIN_FUNCTION *
+FindFunc(PGEN G, const char *Name, size_t Length)
 {
     for (size_t i = 0; i < G->Module->FunctionCount; i++)
     {
         RIN_FUNCTION *Fn = &G->Module->Functions[i];
         if (NamesEqual(Fn->Name, Fn->Length, Name, Length))
-            return Fn->ReturnType;
+            return Fn;
     }
     return NULL;
 }
@@ -184,25 +184,73 @@ CollectStringsStmt(PGEN G, PRIN_STMT S)
 }
 
 static void
+EmitStringData(PGEN G, const char *Chars, size_t Length)
+{
+    fprintf(G->Out, "data $str.%d = { ", G->StrCounter);
+
+    int InString = 0; /* are we currently inside an open "..." segment */
+
+    for (size_t i = 0; i < Length; i++)
+    {
+        unsigned char c = (unsigned char)Chars[i];
+
+        if (c == '\\' && i + 1 < Length)
+        {
+            unsigned char Next = (unsigned char)Chars[i + 1];
+            int ByteVal = -1;
+
+            switch (Next)
+            {
+                case 'n': ByteVal = '\n'; break;
+                case 't': ByteVal = '\t'; break;
+                case 'r': ByteVal = '\r'; break;
+                case '0': ByteVal = '\0'; break;
+                case '\\': ByteVal = '\\'; break;
+                case '"': ByteVal = '"'; break;
+                case '\'': ByteVal = '\''; break;
+                default: break; /* unrecognized escape: fall through, emit backslash literally below */
+            }
+
+            if (ByteVal >= 0)
+            {
+                if (InString)
+                {
+                    fprintf(G->Out, "\", ");
+                    InString = 0;
+                }
+                fprintf(G->Out, "b %d, ", ByteVal);
+                i++; /* consume the escape char too */
+                continue;
+            }
+        }
+
+        if (!InString)
+        {
+            fprintf(G->Out, "b \"");
+            InString = 1;
+        }
+
+        if (c == '"' || c == '\\')
+            fputc('\\', G->Out);
+        fputc(c, G->Out);
+    }
+
+    if (InString)
+        fprintf(G->Out, "\", ");
+
+    fprintf(G->Out, "b 0 }\n");
+}
+
+static void
 CollectStringsExpr(PGEN G, PRIN_EXPR E)
 {
     switch (E->Kind)
     {
         case EXPR_STRING_LIT:
-        {
             E->As.StringLit.DataId = G->StrCounter;
-            fprintf(G->Out, "data $str.%d = { b \"", G->StrCounter);
-            for (size_t i = 0; i < E->As.StringLit.Length; i++)
-            {
-                unsigned char c = (unsigned char)E->As.StringLit.Chars[i];
-                if (c == '"' || c == '\\')
-                    fputc('\\', G->Out);
-                fputc(c, G->Out);
-            }
-            fprintf(G->Out, "\", b 0 }\n");
+            EmitStringData(G, E->As.StringLit.Chars, E->As.StringLit.Length);
             G->StrCounter++;
             break;
-        }
         case EXPR_BINARY:
             CollectStringsExpr(G, E->As.Binary.Left);
             CollectStringsExpr(G, E->As.Binary.Right);
@@ -450,7 +498,8 @@ GenExpr(PGEN G, PRIN_EXPR E)
             for (size_t i = 0; i < E->As.Call.ArgCount; i++)
                 ArgTemps[i] = GenExpr(G, E->As.Call.Args[i]);
 
-            PRIN_TYPE RetType = FindFuncReturnType(G, E->As.Call.Name, E->As.Call.Length);
+            RIN_FUNCTION *Callee = FindFunc(G, E->As.Call.Name, E->As.Call.Length);
+            PRIN_TYPE RetType = Callee ? Callee->ReturnType : NULL;
             int T = -1;
 
             if (RetType && RetType->Kind != TY_VOID)
@@ -463,11 +512,18 @@ GenExpr(PGEN G, PRIN_EXPR E)
                 fprintf(G->Out, "    call $%.*s(", (int)E->As.Call.Length, E->As.Call.Name);
             }
 
+            size_t FixedCount = Callee ? Callee->ParamCount : E->As.Call.ArgCount;
             for (size_t i = 0; i < E->As.Call.ArgCount; i++)
             {
+                if (Callee && Callee->IsVariadic && i == FixedCount)
+                    fprintf(G->Out, "%s...", i == 0 ? "" : ", ");
+
                 char ArgBase = BaseType(E->As.Call.Args[i]->ResolvedType);
                 fprintf(G->Out, "%s%c %%t%d", i == 0 ? "" : ", ", ArgBase, ArgTemps[i]);
             }
+            /* if the call passed no variadic args at all, the '...' marker still needs to be there */
+            if (Callee && Callee->IsVariadic && E->As.Call.ArgCount == FixedCount)
+                fprintf(G->Out, "%s...", FixedCount == 0 ? "" : ", ");
             fprintf(G->Out, ")\n");
 
             free(ArgTemps);
@@ -667,10 +723,16 @@ CodegenModule(PRIN_MODULE Module, FILE *Out)
     G.Module = Module;
 
     for (size_t i = 0; i < Module->FunctionCount; i++)
-        CollectStringsStmt(&G, Module->Functions[i].Body);
+    {
+        if (!Module->Functions[i].IsExtern)
+            CollectStringsStmt(&G, Module->Functions[i].Body);
+    }
 
     for (size_t i = 0; i < Module->FunctionCount; i++)
-        GenFunction(&G, &Module->Functions[i]);
+    {
+        if (!Module->Functions[i].IsExtern)
+            GenFunction(&G, &Module->Functions[i]);
+    }
 
     FreeVars(&G);
     return !HadError();

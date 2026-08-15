@@ -192,6 +192,8 @@ typedef struct
     PRIN_TYPE ReturnType;
     PRIN_STMT Body; /* STMT_BLOCK */
     int Line;
+    int IsExtern;
+    int IsVariadic; /* trailing '...' in an extern declaration */
 } RIN_FUNCTION, *PRIN_FUNCTION;
 
 typedef struct

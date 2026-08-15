@@ -27,6 +27,7 @@ typedef enum
     TOK_FOR,
     TOK_STRUCT,
     TOK_IMPORT,
+    TOK_EXTERN,
     TOK_TRUE,
     TOK_FALSE,
 
@@ -71,6 +72,7 @@ typedef enum
     TOK_SEMI,
     TOK_COMMA,
     TOK_DOT,
+    TOK_ELLIPSIS,
 } TOKEN_TYPE;
 
 typedef struct
