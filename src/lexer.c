@@ -1,10 +1,3 @@
-/*
- * PROJECT:     Rin
- * LICENSE:     MIT (https://spdx.org/licenses/MIT)
- * PURPOSE:     Lexer implementation
- * COPYRIGHT:   Copyright 2026 Alex Mendoza <05alex.mendozaa@gmail.com>
- */
-
 #include "rin/lexer.h"
 #include <string.h>
 #include <ctype.h>
@@ -20,6 +13,7 @@ static const KEYWORD_ENTRY g_Keywords[] =
 {
     { "rite",   TOK_RITE },
     { "ret",    TOK_RET },
+    { "retf",   TOK_RETF },
     { "let",    TOK_LET },
     { "mut",    TOK_MUT },
     { "if",     TOK_IF },

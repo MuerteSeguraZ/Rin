@@ -1,0 +1,23 @@
+rite square(x int) char*
+{
+    retf "%d squared is %d", x, x * x;
+}
+
+rite main() int
+{
+    let name char* = "rin";
+    let age int = 1;
+    let pi float = 3.14;
+    let grade char = 'A';
+
+    print("hello, %s!\n", name);
+    print("age: %d, pi: %f, grade: %c\n", age, pi, grade);
+
+    let s char* = square(5);
+    print("%s\n", s);
+
+    print("literal percent: 100%%\n");
+    print("no placeholders here\n");
+
+    ret 0;
+}

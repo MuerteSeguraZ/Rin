@@ -53,6 +53,16 @@ typedef enum
     UN_DEREF,   /* *x */
 } UNARY_OP;
 
+typedef struct
+{
+    int IsLiteral;
+    const char *Text; /* valid when IsLiteral */
+    size_t Length;
+    int DataId;
+    int ArgIndex;
+    char Spec; /* valid when !IsLiteral: 'd', 's', 'c', 'f' */
+} FMT_SEGMENT;
+
 typedef struct RIN_EXPR
 {
     EXPR_KIND Kind;
@@ -105,6 +115,10 @@ typedef struct RIN_EXPR
             size_t Length;
             struct RIN_EXPR **Args;
             size_t ArgCount;
+
+            int IsFmtBuiltin;
+            FMT_SEGMENT *FmtSegments;
+            size_t FmtSegmentCount;
         } Call;
     } As;
 } RIN_EXPR, *PRIN_EXPR;

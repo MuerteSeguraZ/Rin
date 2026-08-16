@@ -183,10 +183,11 @@ CollectStringsStmt(PGEN G, PRIN_STMT S)
     }
 }
 
-static void
+static int
 EmitStringData(PGEN G, const char *Chars, size_t Length)
 {
-    fprintf(G->Out, "data $str.%d = { ", G->StrCounter);
+    int Id = G->StrCounter++;
+    fprintf(G->Out, "data $str.%d = { ", Id);
 
     int InString = 0; /* are we currently inside an open "..." segment */
 
@@ -239,6 +240,7 @@ EmitStringData(PGEN G, const char *Chars, size_t Length)
         fprintf(G->Out, "\", ");
 
     fprintf(G->Out, "b 0 }\n");
+    return Id;
 }
 
 static void
@@ -247,9 +249,7 @@ CollectStringsExpr(PGEN G, PRIN_EXPR E)
     switch (E->Kind)
     {
         case EXPR_STRING_LIT:
-            E->As.StringLit.DataId = G->StrCounter;
-            EmitStringData(G, E->As.StringLit.Chars, E->As.StringLit.Length);
-            G->StrCounter++;
+            E->As.StringLit.DataId = EmitStringData(G, E->As.StringLit.Chars, E->As.StringLit.Length);
             break;
         case EXPR_BINARY:
             CollectStringsExpr(G, E->As.Binary.Left);
@@ -263,8 +263,22 @@ CollectStringsExpr(PGEN G, PRIN_EXPR E)
             CollectStringsExpr(G, E->As.Assign.Value);
             break;
         case EXPR_CALL:
-            for (size_t i = 0; i < E->As.Call.ArgCount; i++)
-                CollectStringsExpr(G, E->As.Call.Args[i]);
+            if (E->As.Call.IsFmtBuiltin)
+            {
+                for (size_t s = 0; s < E->As.Call.FmtSegmentCount; s++)
+                {
+                    FMT_SEGMENT *Seg = &E->As.Call.FmtSegments[s];
+                    if (Seg->IsLiteral)
+                        Seg->DataId = EmitStringData(G, Seg->Text, Seg->Length);
+                }
+                for (size_t i = 1; i < E->As.Call.ArgCount; i++)
+                    CollectStringsExpr(G, E->As.Call.Args[i]);
+            }
+            else
+            {
+                for (size_t i = 0; i < E->As.Call.ArgCount; i++)
+                    CollectStringsExpr(G, E->As.Call.Args[i]);
+            }
             break;
         default:
             break;
@@ -291,6 +305,84 @@ StmtAlwaysReturns(PRIN_STMT S)
         default:
             return 0;
     }
+}
+
+static int GenExpr(PGEN G, PRIN_EXPR E);
+
+static int
+GenFmtSegmentValue(PGEN G, PRIN_EXPR CallExpr, FMT_SEGMENT *Seg)
+{
+    if (Seg->IsLiteral)
+    {
+        int T = NewTemp(G);
+        fprintf(G->Out, "    %%t%d =l copy $str.%d\n", T, Seg->DataId);
+        return T;
+    }
+
+    PRIN_EXPR Arg = CallExpr->As.Call.Args[Seg->ArgIndex];
+    int ArgTemp = GenExpr(G, Arg);
+    char ArgBase = BaseType(Arg->ResolvedType);
+    int T = NewTemp(G);
+
+    switch (Seg->Spec)
+    {
+        case 'd':
+        {
+            int LongTemp = ArgTemp;
+            if (ArgBase == 'w')
+            {
+                LongTemp = NewTemp(G);
+                fprintf(G->Out, "    %%t%d =l extsw %%t%d\n", LongTemp, ArgTemp);
+            }
+            fprintf(G->Out, "    %%t%d =l call $__rin_fmt_int(l %%t%d)\n", T, LongTemp);
+            break;
+        }
+        case 's':
+            fprintf(G->Out, "    %%t%d =l call $__rin_fmt_str(l %%t%d)\n", T, ArgTemp);
+            break;
+        case 'c':
+            fprintf(G->Out, "    %%t%d =l call $__rin_fmt_char(w %%t%d)\n", T, ArgTemp);
+            break;
+        case 'f':
+        {
+            int DoubleTemp = NewTemp(G);
+            fprintf(G->Out, "    %%t%d =d exts %%t%d\n", DoubleTemp, ArgTemp);
+            fprintf(G->Out, "    %%t%d =l call $__rin_fmt_float(d %%t%d)\n", T, DoubleTemp);
+            break;
+        }
+    }
+
+    return T;
+}
+
+static int
+GenFmtCall(PGEN G, PRIN_EXPR E)
+{
+    int Accum;
+
+    if (E->As.Call.FmtSegmentCount == 0)
+    {
+        Accum = NewTemp(G);
+        fprintf(G->Out, "    %%t%d =l copy $__rin_empty\n", Accum);
+    }
+    else
+    {
+        Accum = GenFmtSegmentValue(G, E, &E->As.Call.FmtSegments[0]);
+        for (size_t s = 1; s < E->As.Call.FmtSegmentCount; s++)
+        {
+            int Next = GenFmtSegmentValue(G, E, &E->As.Call.FmtSegments[s]);
+            int NewAccum = NewTemp(G);
+            fprintf(G->Out, "    %%t%d =l call $__rin_concat(l %%t%d, l %%t%d)\n", NewAccum, Accum, Next);
+            Accum = NewAccum;
+        }
+    }
+
+    if (NamesEqual(E->As.Call.Name, E->As.Call.Length, "print", 5))
+    {
+        fprintf(G->Out, "    call $__rin_print(l %%t%d)\n", Accum);
+    }
+
+    return Accum;
 }
 
 static int GenExpr(PGEN G, PRIN_EXPR E);
@@ -494,6 +586,9 @@ GenExpr(PGEN G, PRIN_EXPR E)
 
         case EXPR_CALL:
         {
+            if (E->As.Call.IsFmtBuiltin)
+                return GenFmtCall(G, E);
+
             int *ArgTemps = malloc(E->As.Call.ArgCount * sizeof(int));
             for (size_t i = 0; i < E->As.Call.ArgCount; i++)
                 ArgTemps[i] = GenExpr(G, E->As.Call.Args[i]);
@@ -721,6 +816,8 @@ CodegenModule(PRIN_MODULE Module, FILE *Out)
     G.StrCounter = 0;
     G.Vars = NULL;
     G.Module = Module;
+
+    fprintf(G.Out, "data $__rin_empty = { b 0 }\n");
 
     for (size_t i = 0; i < Module->FunctionCount; i++)
     {

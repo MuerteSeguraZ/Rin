@@ -196,6 +196,9 @@ ParsePrimary(PPARSER P)
             E->As.Call.Length = Length;
             E->As.Call.Args = Args;
             E->As.Call.ArgCount = ArgCount;
+            E->As.Call.IsFmtBuiltin = 0;
+            E->As.Call.FmtSegments = NULL;
+            E->As.Call.FmtSegmentCount = 0;
             return E;
         }
 
@@ -551,6 +554,60 @@ ParseRet(PPARSER P)
 }
 
 static PRIN_STMT
+ParseRetf(PPARSER P)
+{
+    int Line = P->Current.Line;
+    Advance(P); /* 'retf' */
+
+    Expect(P, TOK_STRING_LIT, "a string literal format after 'retf'");
+    const char *FmtChars = P->Previous.Start;
+    size_t FmtLength = P->Previous.Length;
+    int FmtLine = P->Previous.Line;
+
+    PRIN_EXPR *Args = NULL;
+    size_t ArgCount = 0;
+    size_t ArgCap = 0;
+
+    while (Match(P, TOK_COMMA))
+    {
+        PRIN_EXPR Arg = ParseAssignment(P);
+        if (ArgCount == ArgCap)
+        {
+            size_t NewCap = ArgCap == 0 ? 4 : ArgCap * 2;
+            PRIN_EXPR *NewArgs = ArenaAlloc(P->Arena, NewCap * sizeof(PRIN_EXPR));
+            if (Args)
+                memcpy(NewArgs, Args, ArgCount * sizeof(PRIN_EXPR));
+            Args = NewArgs;
+            ArgCap = NewCap;
+        }
+        Args[ArgCount++] = Arg;
+    }
+
+    Expect(P, TOK_SEMI, "';' after 'retf' arguments");
+
+    PRIN_EXPR *AllArgs = ArenaAlloc(P->Arena, (ArgCount + 1) * sizeof(PRIN_EXPR));
+    PRIN_EXPR FmtExpr = NewExpr(P, EXPR_STRING_LIT, FmtLine);
+    FmtExpr->As.StringLit.Chars = FmtChars;
+    FmtExpr->As.StringLit.Length = FmtLength;
+    AllArgs[0] = FmtExpr;
+    for (size_t i = 0; i < ArgCount; i++)
+        AllArgs[i + 1] = Args[i];
+
+    PRIN_EXPR CallExpr = NewExpr(P, EXPR_CALL, Line);
+    CallExpr->As.Call.Name = "fmt";
+    CallExpr->As.Call.Length = 3;
+    CallExpr->As.Call.Args = AllArgs;
+    CallExpr->As.Call.ArgCount = ArgCount + 1;
+    CallExpr->As.Call.IsFmtBuiltin = 0;
+    CallExpr->As.Call.FmtSegments = NULL;
+    CallExpr->As.Call.FmtSegmentCount = 0;
+
+    PRIN_STMT S = NewStmt(P, STMT_RET, Line);
+    S->As.Ret.Value = CallExpr;
+    return S;
+}
+
+static PRIN_STMT
 ParseStatement(PPARSER P)
 {
     if (Check(P, TOK_LET))
@@ -567,6 +624,9 @@ ParseStatement(PPARSER P)
 
     if (Check(P, TOK_FOR))
         return ParseFor(P);
+
+    if (Check(P, TOK_RETF))
+        return ParseRetf(P);
 
     if (Check(P, TOK_RET))
         return ParseRet(P);

@@ -19,6 +19,7 @@ typedef enum
     /* Keywords */
     TOK_RITE,
     TOK_RET,
+    TOK_RETF,
     TOK_LET,
     TOK_MUT,
     TOK_IF,

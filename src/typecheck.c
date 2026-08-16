@@ -146,6 +146,178 @@ MakeType(PCHECKER C, TYPE_KIND Kind)
     return T;
 }
 
+static PRIN_TYPE
+MakePointerToChar(PCHECKER C)
+{
+    PRIN_TYPE Ptr = MakeType(C, TY_POINTER);
+    Ptr->PointeeType = MakeType(C, TY_CHAR);
+    return Ptr;
+}
+
+static PRIN_TYPE CheckExpr(PCHECKER C, PRIN_EXPR E); /* forward decl, needed by CheckFmtCall below */
+
+static int
+IsFmtOrPrintName(const char *Name, size_t Length)
+{
+    return NamesEqual(Name, Length, "fmt", 3) || NamesEqual(Name, Length, "print", 5);
+}
+
+static const char *
+SpecTypeName(char Spec)
+{
+    switch (Spec)
+    {
+        case 'd': return "int/long/char";
+        case 's': return "char*";
+        case 'c': return "char";
+        case 'f': return "float";
+        default: return "?";
+    }
+}
+
+static int
+SpecMatchesType(char Spec, PRIN_TYPE T)
+{
+    switch (Spec)
+    {
+        case 'd':
+            return T->Kind == TY_INT || T->Kind == TY_LONG || T->Kind == TY_CHAR;
+        case 's':
+            return T->Kind == TY_POINTER && T->PointeeType->Kind == TY_CHAR;
+        case 'c':
+            return T->Kind == TY_CHAR;
+        case 'f':
+            return T->Kind == TY_FLOAT;
+        default:
+            return 0;
+    }
+}
+
+static PRIN_TYPE
+CheckFmtCall(PCHECKER C, PRIN_EXPR E)
+{
+    int IsPrint = NamesEqual(E->As.Call.Name, E->As.Call.Length, "print", 5);
+
+    if (E->As.Call.ArgCount == 0 || E->As.Call.Args[0]->Kind != EXPR_STRING_LIT)
+    {
+        ReportError(E->Line, "'%.*s' requires a literal string as its first argument",
+                    (int)E->As.Call.Length, E->As.Call.Name);
+        for (size_t i = 0; i < E->As.Call.ArgCount; i++)
+            CheckExpr(C, E->As.Call.Args[i]);
+        return IsPrint ? MakeType(C, TY_VOID) : MakePointerToChar(C);
+    }
+
+    for (size_t i = 1; i < E->As.Call.ArgCount; i++)
+        CheckExpr(C, E->As.Call.Args[i]);
+
+    const char *Fmt = E->As.Call.Args[0]->As.StringLit.Chars;
+    size_t FmtLen = E->As.Call.Args[0]->As.StringLit.Length;
+
+    FMT_SEGMENT *Segments = ArenaAlloc(C->Arena, (FmtLen + 1) * sizeof(FMT_SEGMENT));
+    size_t SegCount = 0;
+
+    size_t LitStart = 0;
+    size_t NextArg = 1;
+    int Ok = 1;
+
+    for (size_t i = 0; i < FmtLen; i++)
+    {
+        if (Fmt[i] != '%')
+            continue;
+
+        if (i + 1 >= FmtLen)
+        {
+            ReportError(E->Line, "dangling '%%' at end of format string");
+            Ok = 0;
+            break;
+        }
+
+        char Spec = Fmt[i + 1];
+
+        if (Spec == '%')
+        {
+            if (i > LitStart)
+            {
+                Segments[SegCount].IsLiteral = 1;
+                Segments[SegCount].Text = Fmt + LitStart;
+                Segments[SegCount].Length = i - LitStart;
+                SegCount++;
+            }
+            Segments[SegCount].IsLiteral = 1;
+            Segments[SegCount].Text = "%";
+            Segments[SegCount].Length = 1;
+            SegCount++;
+            i++; /* skip the second '%' */
+            LitStart = i + 1;
+            continue;
+        }
+
+        if (Spec != 'd' && Spec != 's' && Spec != 'c' && Spec != 'f')
+        {
+            ReportError(E->Line, "unknown format specifier '%%%c'", Spec);
+            Ok = 0;
+            i++;
+            continue;
+        }
+
+        /* flush preceding literal text */
+        if (i > LitStart)
+        {
+            Segments[SegCount].IsLiteral = 1;
+            Segments[SegCount].Text = Fmt + LitStart;
+            Segments[SegCount].Length = i - LitStart;
+            SegCount++;
+        }
+
+        if (NextArg >= E->As.Call.ArgCount)
+        {
+            ReportError(E->Line, "'%%%c' has no matching argument", Spec);
+            Ok = 0;
+        }
+        else
+        {
+            PRIN_TYPE ArgType = E->As.Call.Args[NextArg]->ResolvedType;
+            if (!SpecMatchesType(Spec, ArgType))
+            {
+                ReportError(E->Line, "'%%%c' expects '%s'", Spec, SpecTypeName(Spec));
+                Ok = 0;
+            }
+        }
+
+        Segments[SegCount].IsLiteral = 0;
+        Segments[SegCount].ArgIndex = (int)NextArg;
+        Segments[SegCount].Spec = Spec;
+        SegCount++;
+
+        NextArg++;
+        i++; /* skip spec char */
+        LitStart = i + 1;
+    }
+
+    if (LitStart < FmtLen)
+    {
+        Segments[SegCount].IsLiteral = 1;
+        Segments[SegCount].Text = Fmt + LitStart;
+        Segments[SegCount].Length = FmtLen - LitStart;
+        SegCount++;
+    }
+
+    if (NextArg != E->As.Call.ArgCount)
+    {
+        ReportError(E->Line, "'%.*s' has %zu extra argument(s) beyond its format placeholders",
+                    (int)E->As.Call.Length, E->As.Call.Name, E->As.Call.ArgCount - NextArg);
+        Ok = 0;
+    }
+
+    (void)Ok;
+
+    E->As.Call.IsFmtBuiltin = 1;
+    E->As.Call.FmtSegments = Segments;
+    E->As.Call.FmtSegmentCount = SegCount;
+
+    return IsPrint ? MakeType(C, TY_VOID) : MakePointerToChar(C);
+}
+
 static PRIN_TYPE CheckExpr(PCHECKER C, PRIN_EXPR E);
 
 static PRIN_TYPE
@@ -322,6 +494,12 @@ CheckExpr(PCHECKER C, PRIN_EXPR E)
 
         case EXPR_CALL:
         {
+            if (IsFmtOrPrintName(E->As.Call.Name, E->As.Call.Length))
+            {
+                Result = CheckFmtCall(C, E);
+                break;
+            }
+
             FUNC_SIG *Sig = LookupFunc(C, E->As.Call.Name, E->As.Call.Length);
             if (!Sig)
             {
@@ -518,6 +696,9 @@ TypecheckModule(PRIN_MODULE Module, PARENA Arena)
             if (NamesEqual(C.Funcs[j].Name, C.Funcs[j].Length, Fn->Name, Fn->Length))
                 ReportError(Fn->Line, "redefinition of function '%.*s'", (int)Fn->Length, Fn->Name);
         }
+
+        if (IsFmtOrPrintName(Fn->Name, Fn->Length))
+            ReportError(Fn->Line, "cannot redefine builtin '%.*s'", (int)Fn->Length, Fn->Name);
 
         C.Funcs[i].Name = Fn->Name;
         C.Funcs[i].Length = Fn->Length;
