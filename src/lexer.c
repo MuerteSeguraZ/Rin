@@ -31,6 +31,12 @@ static const KEYWORD_ENTRY g_Keywords[] =
     { "bool",   TOK_BOOL },
     { "void",   TOK_VOID },
     { "float",  TOK_FLOAT },
+    { "i8",     TOK_I8 },
+    { "i16",    TOK_I16 },
+    { "u8",     TOK_U8 },
+    { "u16",    TOK_U16 },
+    { "u32",    TOK_U32 },
+    { "u64",    TOK_U64 },
 };
 
 static const size_t g_KeywordCount = sizeof(g_Keywords) / sizeof(g_Keywords[0]);
@@ -177,7 +183,7 @@ LexNumber(PLEXER Lexer)
     if (IsFloat)
         Tok.Value.FloatValue = strtod(Buf, NULL);
     else
-        Tok.Value.IntValue = strtoll(Buf, NULL, 10);
+        Tok.Value.IntValue = (long long)strtoull(Buf, NULL, 10);
 
     return Tok;
 }

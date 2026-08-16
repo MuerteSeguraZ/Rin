@@ -116,9 +116,36 @@ TypesEqual(PRIN_TYPE A, PRIN_TYPE B)
 }
 
 static int
+IsIntegerKind(TYPE_KIND K)
+{
+    switch (K)
+    {
+        case TY_INT: case TY_LONG: case TY_CHAR:
+        case TY_I8: case TY_I16:
+        case TY_U8: case TY_U16: case TY_U32: case TY_U64:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static int
+IntWidth(TYPE_KIND K)
+{
+    switch (K)
+    {
+        case TY_I8: case TY_U8: case TY_CHAR: case TY_BOOL: return 1;
+        case TY_I16: case TY_U16: return 2;
+        case TY_INT: case TY_U32: return 4;
+        case TY_LONG: case TY_U64: return 8;
+        default: return 0;
+    }
+}
+
+static int
 IsNumeric(PRIN_TYPE T)
 {
-    return T->Kind == TY_INT || T->Kind == TY_LONG || T->Kind == TY_CHAR || T->Kind == TY_FLOAT;
+    return IsIntegerKind(T->Kind) || T->Kind == TY_FLOAT;
 }
 
 static const char *
@@ -133,6 +160,12 @@ TypeName(PRIN_TYPE T)
         case TY_BOOL: return "bool";
         case TY_FLOAT: return "float";
         case TY_POINTER: return "pointer";
+        case TY_I8: return "i8";
+        case TY_I16: return "i16";
+        case TY_U8: return "u8";
+        case TY_U16: return "u16";
+        case TY_U32: return "u32";
+        case TY_U64: return "u64";
     }
     return "?";
 }
@@ -154,6 +187,44 @@ MakePointerToChar(PCHECKER C)
     return Ptr;
 }
 
+static PRIN_TYPE
+PromoteIntTypes(PCHECKER C, PRIN_TYPE L, PRIN_TYPE R)
+{
+    if (L->Kind == R->Kind)
+        return L;
+
+    int WidthL = IntWidth(L->Kind);
+    int WidthR = IntWidth(R->Kind);
+
+    if (WidthL == WidthR)
+        return L; /* e.g. int vs u32 collision, keep left operand's type */
+
+    return WidthL > WidthR ? L : R;
+}
+
+static int
+CoerceLiteralTo(PRIN_EXPR E, PRIN_TYPE Target)
+{
+    if (!IsIntegerKind(Target->Kind))
+        return 0;
+
+    if (E->Kind == EXPR_INT_LIT)
+    {
+        E->ResolvedType = Target;
+        return 1;
+    }
+
+    if (E->Kind == EXPR_UNARY && E->As.Unary.Op == UN_NEG &&
+        E->As.Unary.Operand->Kind == EXPR_INT_LIT)
+    {
+        E->ResolvedType = Target;
+        E->As.Unary.Operand->ResolvedType = Target;
+        return 1;
+    }
+
+    return 0;
+}
+
 static PRIN_TYPE CheckExpr(PCHECKER C, PRIN_EXPR E); /* forward decl, needed by CheckFmtCall below */
 
 static int
@@ -167,7 +238,7 @@ SpecTypeName(char Spec)
 {
     switch (Spec)
     {
-        case 'd': return "int/long/char";
+        case 'd': return "an integer type";
         case 's': return "char*";
         case 'c': return "char";
         case 'f': return "float";
@@ -181,7 +252,7 @@ SpecMatchesType(char Spec, PRIN_TYPE T)
     switch (Spec)
     {
         case 'd':
-            return T->Kind == TY_INT || T->Kind == TY_LONG || T->Kind == TY_CHAR;
+            return IsIntegerKind(T->Kind);
         case 's':
             return T->Kind == TY_POINTER && T->PointeeType->Kind == TY_CHAR;
         case 'c':
@@ -327,25 +398,55 @@ CheckBinary(PCHECKER C, PRIN_EXPR E)
     PRIN_TYPE R = CheckExpr(C, E->As.Binary.Right);
     BINARY_OP Op = E->As.Binary.Op;
 
+    if (IsIntegerKind(L->Kind) && CoerceLiteralTo(E->As.Binary.Right, L))
+        R = L;
+    else if (IsIntegerKind(R->Kind) && CoerceLiteralTo(E->As.Binary.Left, R))
+        L = R;
+
+    E->As.Binary.OperandType = NULL;
+
     switch (Op)
     {
         case BIN_ADD: case BIN_SUB: case BIN_MUL: case BIN_DIV: case BIN_MOD:
+        {
             if (!IsNumeric(L) || !IsNumeric(R))
             {
                 ReportError(E->Line, "arithmetic requires numeric operands, got '%s' and '%s'", TypeName(L), TypeName(R));
                 return MakeType(C, TY_INT);
             }
-            return L->Kind == TY_FLOAT || R->Kind == TY_FLOAT ? MakeType(C, TY_FLOAT) : L;
+            PRIN_TYPE Result = (L->Kind == TY_FLOAT || R->Kind == TY_FLOAT)
+                ? MakeType(C, TY_FLOAT)
+                : PromoteIntTypes(C, L, R);
+            E->As.Binary.OperandType = Result;
+            return Result;
+        }
 
         case BIN_EQ: case BIN_NEQ:
-            if (!TypesEqual(L, R))
+        {
+            if (IsNumeric(L) && IsNumeric(R))
+                E->As.Binary.OperandType = (L->Kind == TY_FLOAT || R->Kind == TY_FLOAT)
+                    ? MakeType(C, TY_FLOAT) : PromoteIntTypes(C, L, R);
+            else if (!TypesEqual(L, R))
                 ReportError(E->Line, "cannot compare '%s' with '%s'", TypeName(L), TypeName(R));
+            else
+                E->As.Binary.OperandType = L;
             return MakeType(C, TY_BOOL);
+        }
 
         case BIN_LT: case BIN_GT: case BIN_LE: case BIN_GE:
+        {
             if (!IsNumeric(L) || !IsNumeric(R))
+            {
                 ReportError(E->Line, "comparison requires numeric operands, got '%s' and '%s'", TypeName(L), TypeName(R));
+                E->As.Binary.OperandType = MakeType(C, TY_INT);
+            }
+            else
+            {
+                E->As.Binary.OperandType = (L->Kind == TY_FLOAT || R->Kind == TY_FLOAT)
+                    ? MakeType(C, TY_FLOAT) : PromoteIntTypes(C, L, R);
+            }
             return MakeType(C, TY_BOOL);
+        }
 
         case BIN_AND: case BIN_OR:
             if (L->Kind != TY_BOOL || R->Kind != TY_BOOL)
@@ -353,9 +454,17 @@ CheckBinary(PCHECKER C, PRIN_EXPR E)
             return MakeType(C, TY_BOOL);
 
         case BIN_BAND: case BIN_BOR: case BIN_BXOR: case BIN_SHL: case BIN_SHR:
-            if (L->Kind == TY_FLOAT || R->Kind == TY_FLOAT)
-                ReportError(E->Line, "bitwise operator cannot be used with 'float'");
-            return L;
+        {
+            if (!IsIntegerKind(L->Kind) || !IsIntegerKind(R->Kind))
+            {
+                ReportError(E->Line, "bitwise operator requires integer operands, got '%s' and '%s'", TypeName(L), TypeName(R));
+                E->As.Binary.OperandType = MakeType(C, TY_INT);
+                return E->As.Binary.OperandType;
+            }
+            PRIN_TYPE Result = PromoteIntTypes(C, L, R);
+            E->As.Binary.OperandType = Result;
+            return Result;
+        }
     }
 
     return MakeType(C, TY_INT);
@@ -474,7 +583,7 @@ CheckExpr(PCHECKER C, PRIN_EXPR E)
                 {
                     ReportError(E->Line, "cannot assign to immutable '%.*s'", (int)Sym->Length, Sym->Name);
                 }
-                if (!TypesEqual(Sym->Type, ValueType))
+                if (!TypesEqual(Sym->Type, ValueType) && !CoerceLiteralTo(E->As.Assign.Value, Sym->Type))
                 {
                     ReportError(E->Line, "cannot assign '%s' to '%s'", TypeName(ValueType), TypeName(Sym->Type));
                 }
@@ -485,7 +594,7 @@ CheckExpr(PCHECKER C, PRIN_EXPR E)
             {
                 /* deref assignment target */
                 PRIN_TYPE TargetType = CheckExpr(C, E->As.Assign.Target);
-                if (!TypesEqual(TargetType, ValueType))
+                if (!TypesEqual(TargetType, ValueType) && !CoerceLiteralTo(E->As.Assign.Value, TargetType))
                     ReportError(E->Line, "cannot assign '%s' to '%s'", TypeName(ValueType), TypeName(TargetType));
                 Result = TargetType;
             }
@@ -525,7 +634,8 @@ CheckExpr(PCHECKER C, PRIN_EXPR E)
             for (size_t i = 0; i < CheckCount; i++)
             {
                 PRIN_TYPE ArgType = CheckExpr(C, E->As.Call.Args[i]);
-                if (!TypesEqual(ArgType, Sig->Params[i].Type))
+                if (!TypesEqual(ArgType, Sig->Params[i].Type) &&
+                    !CoerceLiteralTo(E->As.Call.Args[i], Sig->Params[i].Type))
                 {
                     ReportError(E->Line, "argument %zu of '%.*s' expects '%s', got '%s'",
                                 i + 1, (int)E->As.Call.Length, E->As.Call.Name,
@@ -577,7 +687,7 @@ CheckStmt(PCHECKER C, PRIN_STMT S)
             if (S->As.VarDecl.Init)
             {
                 PRIN_TYPE InitType = CheckExpr(C, S->As.VarDecl.Init);
-                if (!TypesEqual(DeclType, InitType))
+                if (!TypesEqual(DeclType, InitType) && !CoerceLiteralTo(S->As.VarDecl.Init, DeclType))
                 {
                     ReportError(S->Line, "cannot initialize '%.*s' of type '%s' with '%s'",
                                 (int)S->As.VarDecl.Length, S->As.VarDecl.Name,

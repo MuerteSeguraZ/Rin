@@ -1,0 +1,24 @@
+rite main() int {
+    let a u8 = 250;
+    let b u8 = 10;
+    mut sum u8 = a + b;
+    print("sum=%d\n", sum);
+
+    let x i8 = -100;
+    let y i8 = -50;
+    print("x+y=%d\n", x + y);
+
+    let big u64 = 18446744073709551615;
+    print("big=%d\n", big);
+
+    let neg i16 = -1;
+    let shifted u16 = 65535;
+    print("neg=%d shifted=%d\n", neg, shifted);
+
+    mut c u32 = 4000000000;
+    mut d u32 = 1000000000;
+    print("c/d=%d c%%d=%d\n", c / d, c % d);
+
+    print("done\n");
+    ret 0;
+}

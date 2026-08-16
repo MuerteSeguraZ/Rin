@@ -12,6 +12,12 @@ typedef enum
     TY_BOOL,
     TY_FLOAT,
     TY_POINTER,
+    TY_I8,
+    TY_I16,
+    TY_U8,
+    TY_U16,
+    TY_U32,
+    TY_U64,
 } TYPE_KIND;
 
 typedef struct RIN_TYPE
@@ -95,6 +101,7 @@ typedef struct RIN_EXPR
             BINARY_OP Op;
             struct RIN_EXPR *Left;
             struct RIN_EXPR *Right;
+            struct RIN_TYPE *OperandType;
         } Binary;
 
         struct

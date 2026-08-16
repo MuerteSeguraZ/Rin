@@ -41,43 +41,123 @@ BaseType(PRIN_TYPE T)
     switch (T->Kind)
     {
         case TY_LONG:
+        case TY_U64:
         case TY_POINTER:
             return 'l';
         case TY_FLOAT:
             return 's';
         case TY_VOID:
             return 0;
-        default: /* int, bool, char */
+        default:
             return 'w';
     }
 }
 
-static const char *
-StoreOp(char Base)
+static int
+IsUnsignedType(PRIN_TYPE T)
 {
-    switch (Base)
+    switch (T->Kind)
     {
-        case 'l': return "storel";
-        case 's': return "stores";
-        default:  return "storew";
-    }
-}
-
-static const char *
-LoadOp(char Base)
-{
-    switch (Base)
-    {
-        case 'l': return "loadl";
-        case 's': return "loads";
-        default:  return "loadw";
+        case TY_U8: case TY_U16: case TY_U32: case TY_U64: case TY_CHAR:
+            return 1;
+        default:
+            return 0;
     }
 }
 
 static int
-SlotSize(char Base)
+TypeWidth(PRIN_TYPE T)
 {
-    return Base == 'l' ? 8 : 4;
+    switch (T->Kind)
+    {
+        case TY_I8: case TY_U8: case TY_CHAR: case TY_BOOL: return 1;
+        case TY_I16: case TY_U16: return 2;
+        case TY_FLOAT: return 4;
+        case TY_LONG: case TY_U64: case TY_POINTER: return 8;
+        default: return 4; /* int, u32 */
+    }
+}
+
+static int
+TypeAlign(PRIN_TYPE T)
+{
+    return TypeWidth(T) > 4 ? 8 : 4;
+}
+
+static const char *
+StoreOp(PRIN_TYPE T)
+{
+    switch (TypeWidth(T))
+    {
+        case 1: return "storeb";
+        case 2: return "storeh";
+        default:
+        {
+            char Base = BaseType(T);
+            if (Base == 'l') return "storel";
+            if (Base == 's') return "stores";
+            return "storew";
+        }
+    }
+}
+
+static const char *
+LoadOp(PRIN_TYPE T)
+{
+    switch (T->Kind)
+    {
+        case TY_I8:  return "loadsb";
+        case TY_U8: case TY_CHAR: case TY_BOOL: return "loadub";
+        case TY_I16: return "loadsh";
+        case TY_U16: return "loaduh";
+        default:
+        {
+            char Base = BaseType(T);
+            if (Base == 'l') return "loadl";
+            if (Base == 's') return "loads";
+            return "loadw";
+        }
+    }
+}
+
+static int
+NarrowResult(PGEN G, int Temp, PRIN_TYPE T)
+{
+    const char *Op = NULL;
+    switch (T->Kind)
+    {
+        case TY_I8:  Op = "extsb"; break;
+        case TY_U8:  Op = "extub"; break;
+        case TY_I16: Op = "extsh"; break;
+        case TY_U16: Op = "extuh"; break;
+        default: return Temp;
+    }
+
+    int Result = NewTemp(G);
+    fprintf(G->Out, "    %%t%d =w %s %%t%d\n", Result, Op, Temp);
+    return Result;
+}
+
+/* widen a temp of FromType's compute class up to ToType's compute class
+   (currently only w -> l, sign/zero-extended per FromType's signedness) */
+static int
+WidenTo(PGEN G, int Temp, PRIN_TYPE FromType, PRIN_TYPE ToType)
+{
+    char FromBase = BaseType(FromType);
+    char ToBase = BaseType(ToType);
+
+    if (FromBase == ToBase)
+        return Temp;
+
+    if (FromBase == 'w' && ToBase == 'l')
+    {
+        int T = NewTemp(G);
+        fprintf(G->Out, "    %%t%d =l %s %%t%d\n", T,
+                IsUnsignedType(FromType) ? "extuw" : "extsw", Temp);
+        return T;
+    }
+
+    return Temp;
 }
 
 static int
@@ -108,8 +188,7 @@ DeclareVar(PGEN G, const char *Name, size_t Length, PRIN_TYPE Type)
     V->Next = G->Vars;
     G->Vars = V;
 
-    char Base = BaseType(Type);
-    fprintf(G->Out, "    %%t%d =l alloc%d %d\n", V->SlotId, SlotSize(Base), SlotSize(Base));
+    fprintf(G->Out, "    %%t%d =l alloc%d %d\n", V->SlotId, TypeAlign(Type), TypeWidth(Type));
     return V;
 }
 
@@ -329,12 +408,15 @@ GenFmtSegmentValue(PGEN G, PRIN_EXPR CallExpr, FMT_SEGMENT *Seg)
         case 'd':
         {
             int LongTemp = ArgTemp;
+            int IsUnsigned = IsUnsignedType(Arg->ResolvedType);
             if (ArgBase == 'w')
             {
                 LongTemp = NewTemp(G);
-                fprintf(G->Out, "    %%t%d =l extsw %%t%d\n", LongTemp, ArgTemp);
+                fprintf(G->Out, "    %%t%d =l %s %%t%d\n", LongTemp,
+                        IsUnsigned ? "extuw" : "extsw", ArgTemp);
             }
-            fprintf(G->Out, "    %%t%d =l call $__rin_fmt_int(l %%t%d)\n", T, LongTemp);
+            fprintf(G->Out, "    %%t%d =l call $%s(l %%t%d)\n", T,
+                    IsUnsigned ? "__rin_fmt_uint" : "__rin_fmt_int", LongTemp);
             break;
         }
         case 's':
@@ -408,26 +490,26 @@ GenLValueAddr(PGEN G, PRIN_EXPR E)
 }
 
 static const char *
-BinOpName(BINARY_OP Op, char Base)
+BinOpName(BINARY_OP Op, char Base, int Unsigned)
 {
     switch (Op)
     {
         case BIN_ADD: return "add";
         case BIN_SUB: return "sub";
         case BIN_MUL: return "mul";
-        case BIN_DIV: return Base == 's' ? "div" : "div";
-        case BIN_MOD: return "rem";
+        case BIN_DIV: return (Base != 's' && Unsigned) ? "udiv" : "div";
+        case BIN_MOD: return (Base != 's' && Unsigned) ? "urem" : "rem";
         case BIN_BAND: return "and";
         case BIN_BOR: return "or";
         case BIN_BXOR: return "xor";
         case BIN_SHL: return "shl";
-        case BIN_SHR: return "sar";
+        case BIN_SHR: return Unsigned ? "shr" : "sar";
         default: return "add";
     }
 }
 
 static const char *
-CmpOpName(BINARY_OP Op, char Base)
+CmpOpName(BINARY_OP Op, char Base, int Unsigned)
 {
     if (Base == 's')
     {
@@ -450,10 +532,10 @@ CmpOpName(BINARY_OP Op, char Base)
     {
         case BIN_EQ: Base3 = "ceq"; break;
         case BIN_NEQ: Base3 = "cne"; break;
-        case BIN_LT: Base3 = "cslt"; break;
-        case BIN_GT: Base3 = "csgt"; break;
-        case BIN_LE: Base3 = "csle"; break;
-        case BIN_GE: Base3 = "csge"; break;
+        case BIN_LT: Base3 = Unsigned ? "cult" : "cslt"; break;
+        case BIN_GT: Base3 = Unsigned ? "cugt" : "csgt"; break;
+        case BIN_LE: Base3 = Unsigned ? "cule" : "csle"; break;
+        case BIN_GE: Base3 = Unsigned ? "cuge" : "csge"; break;
         default: Base3 = "ceq"; break;
     }
     snprintf(Buf, sizeof(Buf), "%s%s", Base3, Suffix);
@@ -506,21 +588,27 @@ GenExpr(PGEN G, PRIN_EXPR E)
         {
             PVAR V = FindVar(G, E->As.Ident.Name, E->As.Ident.Length);
             int T = NewTemp(G);
-            fprintf(G->Out, "    %%t%d =%c %s %%t%d\n", T, Base, LoadOp(Base), V->SlotId);
+            fprintf(G->Out, "    %%t%d =%c %s %%t%d\n", T, Base, LoadOp(V->Type), V->SlotId);
             return T;
         }
 
         case EXPR_BINARY:
         {
-            char OperandBase = BaseType(E->As.Binary.Left->ResolvedType);
+            PRIN_TYPE OpType = E->As.Binary.OperandType;
+            int Unsigned = IsUnsignedType(OpType);
+            char OperandBase = BaseType(OpType);
+
             int L = GenExpr(G, E->As.Binary.Left);
+            L = WidenTo(G, L, E->As.Binary.Left->ResolvedType, OpType);
             int R = GenExpr(G, E->As.Binary.Right);
+            R = WidenTo(G, R, E->As.Binary.Right->ResolvedType, OpType);
             int T = NewTemp(G);
 
             switch (E->As.Binary.Op)
             {
                 case BIN_EQ: case BIN_NEQ: case BIN_LT: case BIN_GT: case BIN_LE: case BIN_GE:
-                    fprintf(G->Out, "    %%t%d =w %s %%t%d, %%t%d\n", T, CmpOpName(E->As.Binary.Op, OperandBase), L, R);
+                    fprintf(G->Out, "    %%t%d =w %s %%t%d, %%t%d\n", T,
+                            CmpOpName(E->As.Binary.Op, OperandBase, Unsigned), L, R);
                     break;
 
                 case BIN_AND:
@@ -531,7 +619,8 @@ GenExpr(PGEN G, PRIN_EXPR E)
 
                 default:
                     fprintf(G->Out, "    %%t%d =%c %s %%t%d, %%t%d\n", T, OperandBase,
-                            BinOpName(E->As.Binary.Op, OperandBase), L, R);
+                            BinOpName(E->As.Binary.Op, OperandBase, Unsigned), L, R);
+                    T = NarrowResult(G, T, OpType);
                     break;
             }
             return T;
@@ -551,7 +640,7 @@ GenExpr(PGEN G, PRIN_EXPR E)
             {
                 int Ptr = GenExpr(G, E->As.Unary.Operand);
                 int T = NewTemp(G);
-                fprintf(G->Out, "    %%t%d =%c %s %%t%d\n", T, Base, LoadOp(Base), Ptr);
+                fprintf(G->Out, "    %%t%d =%c %s %%t%d\n", T, Base, LoadOp(E->ResolvedType), Ptr);
                 return T;
             }
 
@@ -562,12 +651,14 @@ GenExpr(PGEN G, PRIN_EXPR E)
             {
                 case UN_NEG:
                     fprintf(G->Out, "    %%t%d =%c neg %%t%d\n", T, Base, Operand);
+                    T = NarrowResult(G, T, E->ResolvedType);
                     break;
                 case UN_NOT:
                     fprintf(G->Out, "    %%t%d =w ceqw %%t%d, 0\n", T, Operand);
                     break;
                 case UN_BNOT:
                     fprintf(G->Out, "    %%t%d =%c xor %%t%d, -1\n", T, Base, Operand);
+                    T = NarrowResult(G, T, E->ResolvedType);
                     break;
                 default:
                     break;
@@ -579,8 +670,7 @@ GenExpr(PGEN G, PRIN_EXPR E)
         {
             int Value = GenExpr(G, E->As.Assign.Value);
             int Addr = GenLValueAddr(G, E->As.Assign.Target);
-            char TargetBase = BaseType(E->As.Assign.Target->ResolvedType);
-            fprintf(G->Out, "    %s %%t%d, %%t%d\n", StoreOp(TargetBase), Value, Addr);
+            fprintf(G->Out, "    %s %%t%d, %%t%d\n", StoreOp(E->As.Assign.Target->ResolvedType), Value, Addr);
             return Value;
         }
 
@@ -650,8 +740,7 @@ GenStmt(PGEN G, PRIN_STMT S)
             if (S->As.VarDecl.Init)
             {
                 int Val = GenExpr(G, S->As.VarDecl.Init);
-                char Base = BaseType(S->As.VarDecl.Type);
-                fprintf(G->Out, "    %s %%t%d, %%t%d\n", StoreOp(Base), Val, V->SlotId);
+                fprintf(G->Out, "    %s %%t%d, %%t%d\n", StoreOp(S->As.VarDecl.Type), Val, V->SlotId);
             }
             break;
         }
@@ -788,8 +877,7 @@ GenFunction(PGEN G, RIN_FUNCTION *Fn)
     for (size_t i = 0; i < Fn->ParamCount; i++)
     {
         PVAR V = DeclareVar(G, Fn->Params[i].Name, Fn->Params[i].Length, Fn->Params[i].Type);
-        char PBase = BaseType(Fn->Params[i].Type);
-        fprintf(G->Out, "    %s %%t%d, %%t%d\n", StoreOp(PBase), ParamTemps[i], V->SlotId);
+        fprintf(G->Out, "    %s %%t%d, %%t%d\n", StoreOp(Fn->Params[i].Type), ParamTemps[i], V->SlotId);
     }
     free(ParamTemps);
 

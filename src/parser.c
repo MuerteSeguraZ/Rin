@@ -88,6 +88,12 @@ ParseType(PPARSER P)
         case TOK_BOOL:  Kind = TY_BOOL; break;
         case TOK_VOID:  Kind = TY_VOID; break;
         case TOK_FLOAT: Kind = TY_FLOAT; break;
+        case TOK_I8:    Kind = TY_I8; break;
+        case TOK_I16:   Kind = TY_I16; break;
+        case TOK_U8:    Kind = TY_U8; break;
+        case TOK_U16:   Kind = TY_U16; break;
+        case TOK_U32:   Kind = TY_U32; break;
+        case TOK_U64:   Kind = TY_U64; break;
         default:
             ReportError(P->Current.Line, "expected a type");
             P->Panic = 1;
@@ -336,6 +342,7 @@ ParseBinaryRHS(PPARSER P, int MinPrec, PRIN_EXPR Left)
         NewLeft->As.Binary.Op = Rule->Op;
         NewLeft->As.Binary.Left = Left;
         NewLeft->As.Binary.Right = Right;
+        NewLeft->As.Binary.OperandType = NULL;
         Left = NewLeft;
     }
 }

@@ -39,6 +39,12 @@ typedef enum
     TOK_BOOL,
     TOK_VOID,
     TOK_FLOAT,
+    TOK_I8,
+    TOK_I16,
+    TOK_U8,
+    TOK_U16,
+    TOK_U32,
+    TOK_U64,
 
     /* Operators */
     TOK_PLUS,
