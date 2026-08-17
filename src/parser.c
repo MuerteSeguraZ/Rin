@@ -72,6 +72,9 @@ NewType(PPARSER P, TYPE_KIND Kind)
     PRIN_TYPE T = ArenaAlloc(P->Arena, sizeof(RIN_TYPE));
     T->Kind = Kind;
     T->PointeeType = NULL;
+    T->ElementType = NULL;
+    T->Length = 0;
+    T->IsSlice = 0;
     return T;
 }
 
@@ -109,6 +112,33 @@ ParseType(PPARSER P)
         PRIN_TYPE Ptr = NewType(P, TY_POINTER);
         Ptr->PointeeType = Base;
         Base = Ptr;
+    }
+
+    if (Match(P, TOK_LBRACKET))
+    {
+        PRIN_TYPE Arr = NewType(P, TY_ARRAY);
+        Arr->ElementType = Base;
+
+        if (Match(P, TOK_RBRACKET))
+        {
+            Arr->IsSlice = 1;
+        }
+        else
+        {
+            if (!Check(P, TOK_INT_LIT))
+            {
+                ReportError(P->Current.Line, "expected an array size or ']'");
+                P->Panic = 1;
+            }
+            else
+            {
+                Arr->Length = (size_t)P->Current.Value.IntValue;
+                Advance(P);
+            }
+            Expect(P, TOK_RBRACKET, "']' after array size");
+        }
+
+        Base = Arr;
     }
 
     return Base;
@@ -203,6 +233,7 @@ ParsePrimary(PPARSER P)
             E->As.Call.Args = Args;
             E->As.Call.ArgCount = ArgCount;
             E->As.Call.IsFmtBuiltin = 0;
+            E->As.Call.IsLenBuiltin = 0;
             E->As.Call.FmtSegments = NULL;
             E->As.Call.FmtSegmentCount = 0;
             return E;
@@ -211,6 +242,38 @@ ParsePrimary(PPARSER P)
         PRIN_EXPR E = NewExpr(P, EXPR_IDENT, Line);
         E->As.Ident.Name = Name;
         E->As.Ident.Length = Length;
+        return E;
+    }
+
+    if (Match(P, TOK_LBRACKET))
+    {
+        PRIN_EXPR *Elements = NULL;
+        size_t Count = 0;
+        size_t Cap = 0;
+
+        if (!Check(P, TOK_RBRACKET))
+        {
+            do
+            {
+                PRIN_EXPR El = ParseAssignment(P);
+                if (Count == Cap)
+                {
+                    size_t NewCap = Cap == 0 ? 4 : Cap * 2;
+                    PRIN_EXPR *NewElements = ArenaAlloc(P->Arena, NewCap * sizeof(PRIN_EXPR));
+                    if (Elements)
+                        memcpy(NewElements, Elements, Count * sizeof(PRIN_EXPR));
+                    Elements = NewElements;
+                    Cap = NewCap;
+                }
+                Elements[Count++] = El;
+            } while (Match(P, TOK_COMMA));
+        }
+
+        Expect(P, TOK_RBRACKET, "']' after array literal");
+
+        PRIN_EXPR E = NewExpr(P, EXPR_ARRAY_LIT, Line);
+        E->As.ArrayLit.Elements = Elements;
+        E->As.ArrayLit.Count = Count;
         return E;
     }
 
@@ -224,6 +287,26 @@ ParsePrimary(PPARSER P)
     ReportError(Line, "expected an expression");
     P->Panic = 1;
     return NewExpr(P, EXPR_INT_LIT, Line); /* dummy node to keep parsing */
+}
+
+static PRIN_EXPR
+ParsePostfix(PPARSER P)
+{
+    PRIN_EXPR E = ParsePrimary(P);
+
+    while (Match(P, TOK_LBRACKET))
+    {
+        int Line = P->Previous.Line;
+        PRIN_EXPR Idx = ParseExpr(P);
+        Expect(P, TOK_RBRACKET, "']' after array index");
+
+        PRIN_EXPR Node = NewExpr(P, EXPR_INDEX, Line);
+        Node->As.Index.Array = E;
+        Node->As.Index.Index = Idx;
+        E = Node;
+    }
+
+    return E;
 }
 
 static PRIN_EXPR
@@ -271,7 +354,7 @@ ParseUnary(PPARSER P)
         return E;
     }
 
-    return ParsePrimary(P);
+    return ParsePostfix(P);
 }
 
 typedef struct
@@ -365,6 +448,7 @@ ParseAssignment(PPARSER P)
         PRIN_EXPR Value = ParseAssignment(P);
 
         if (Left->Kind != EXPR_IDENT &&
+            Left->Kind != EXPR_INDEX &&
             !(Left->Kind == EXPR_UNARY && Left->As.Unary.Op == UN_DEREF))
         {
             ReportError(Line, "invalid assignment target");
@@ -606,6 +690,7 @@ ParseRetf(PPARSER P)
     CallExpr->As.Call.Args = AllArgs;
     CallExpr->As.Call.ArgCount = ArgCount + 1;
     CallExpr->As.Call.IsFmtBuiltin = 0;
+    CallExpr->As.Call.IsLenBuiltin = 0;
     CallExpr->As.Call.FmtSegments = NULL;
     CallExpr->As.Call.FmtSegmentCount = 0;
 

@@ -18,12 +18,16 @@ typedef enum
     TY_U16,
     TY_U32,
     TY_U64,
+    TY_ARRAY,
 } TYPE_KIND;
 
 typedef struct RIN_TYPE
 {
     TYPE_KIND Kind;
     struct RIN_TYPE *PointeeType; /* only used when Kind == TY_POINTER */
+    struct RIN_TYPE *ElementType;
+    size_t Length;
+    int IsSlice;
 } RIN_TYPE, *PRIN_TYPE;
 
 /* ---- Expressions ---- */
@@ -40,6 +44,8 @@ typedef enum
     EXPR_UNARY,
     EXPR_ASSIGN,
     EXPR_CALL,
+    EXPR_ARRAY_LIT,
+    EXPR_INDEX,
 } EXPR_KIND;
 
 typedef enum
@@ -126,7 +132,21 @@ typedef struct RIN_EXPR
             int IsFmtBuiltin;
             FMT_SEGMENT *FmtSegments;
             size_t FmtSegmentCount;
+
+            int IsLenBuiltin;
         } Call;
+
+        struct
+        {
+            struct RIN_EXPR **Elements;
+            size_t Count;
+        } ArrayLit;
+
+        struct
+        {
+            struct RIN_EXPR *Array;
+            struct RIN_EXPR *Index;
+        } Index;
     } As;
 } RIN_EXPR, *PRIN_EXPR;
 

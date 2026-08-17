@@ -112,7 +112,25 @@ TypesEqual(PRIN_TYPE A, PRIN_TYPE B)
         return 0;
     if (A->Kind == TY_POINTER)
         return TypesEqual(A->PointeeType, B->PointeeType);
+    if (A->Kind == TY_ARRAY)
+    {
+        if (A->IsSlice != B->IsSlice)
+            return 0;
+        if (!A->IsSlice && A->Length != B->Length)
+            return 0;
+        return TypesEqual(A->ElementType, B->ElementType);
+    }
     return 1;
+}
+
+static int
+ArrayCoercesToSlice(PRIN_TYPE From, PRIN_TYPE To)
+{
+    if (To->Kind != TY_ARRAY || !To->IsSlice)
+        return 0;
+    if (From->Kind != TY_ARRAY || From->IsSlice)
+        return 0;
+    return TypesEqual(From->ElementType, To->ElementType);
 }
 
 static int
@@ -166,6 +184,18 @@ TypeName(PRIN_TYPE T)
         case TY_U16: return "u16";
         case TY_U32: return "u32";
         case TY_U64: return "u64";
+        case TY_ARRAY:
+        {
+            static char Bufs[4][64];
+            static int Which = 0;
+            char *Buf = Bufs[Which];
+            Which = (Which + 1) % 4;
+            if (T->IsSlice)
+                snprintf(Buf, 64, "%s[]", TypeName(T->ElementType));
+            else
+                snprintf(Buf, 64, "%s[%zu]", TypeName(T->ElementType), T->Length);
+            return Buf;
+        }
     }
     return "?";
 }
@@ -176,6 +206,9 @@ MakeType(PCHECKER C, TYPE_KIND Kind)
     PRIN_TYPE T = ArenaAlloc(C->Arena, sizeof(RIN_TYPE));
     T->Kind = Kind;
     T->PointeeType = NULL;
+    T->ElementType = NULL;
+    T->Length = 0;
+    T->IsSlice = 0;
     return T;
 }
 
@@ -583,6 +616,14 @@ CheckExpr(PCHECKER C, PRIN_EXPR E)
                 {
                     ReportError(E->Line, "cannot assign to immutable '%.*s'", (int)Sym->Length, Sym->Name);
                 }
+                if (Sym->Type->Kind == TY_ARRAY)
+                {
+                    ReportError(E->Line, "cannot assign directly to array '%.*s' - assign to individual elements instead",
+                                (int)Sym->Length, Sym->Name);
+                    E->As.Assign.Target->ResolvedType = Sym->Type;
+                    Result = Sym->Type;
+                    break;
+                }
                 if (!TypesEqual(Sym->Type, ValueType) && !CoerceLiteralTo(E->As.Assign.Value, Sym->Type))
                 {
                     ReportError(E->Line, "cannot assign '%s' to '%s'", TypeName(ValueType), TypeName(Sym->Type));
@@ -601,8 +642,76 @@ CheckExpr(PCHECKER C, PRIN_EXPR E)
             break;
         }
 
+        case EXPR_ARRAY_LIT:
+        {
+            if (E->As.ArrayLit.Count == 0)
+            {
+                ReportError(E->Line, "empty array literal - element type cannot be inferred");
+                Result = MakeType(C, TY_INT);
+                break;
+            }
+
+            PRIN_TYPE ElemType = CheckExpr(C, E->As.ArrayLit.Elements[0]);
+            for (size_t i = 1; i < E->As.ArrayLit.Count; i++)
+            {
+                PRIN_TYPE T = CheckExpr(C, E->As.ArrayLit.Elements[i]);
+                if (!TypesEqual(T, ElemType) && !CoerceLiteralTo(E->As.ArrayLit.Elements[i], ElemType))
+                {
+                    ReportError(E->As.ArrayLit.Elements[i]->Line,
+                                "array element %zu has type '%s', expected '%s'",
+                                i + 1, TypeName(T), TypeName(ElemType));
+                }
+            }
+
+            PRIN_TYPE Arr = MakeType(C, TY_ARRAY);
+            Arr->ElementType = ElemType;
+            Arr->Length = E->As.ArrayLit.Count;
+            Result = Arr;
+            break;
+        }
+
+        case EXPR_INDEX:
+        {
+            PRIN_TYPE ArrType = CheckExpr(C, E->As.Index.Array);
+            PRIN_TYPE IdxType = CheckExpr(C, E->As.Index.Index);
+
+            if (!IsIntegerKind(IdxType->Kind))
+                ReportError(E->Line, "array index must be an integer, got '%s'", TypeName(IdxType));
+
+            if (ArrType->Kind == TY_ARRAY)
+                Result = ArrType->ElementType;
+            else if (ArrType->Kind == TY_POINTER)
+                Result = ArrType->PointeeType;
+            else
+            {
+                ReportError(E->Line, "cannot index into '%s'", TypeName(ArrType));
+                Result = MakeType(C, TY_INT);
+            }
+            break;
+        }
+
         case EXPR_CALL:
         {
+            if (NamesEqual(E->As.Call.Name, E->As.Call.Length, "len", 3))
+            {
+                if (E->As.Call.ArgCount != 1)
+                {
+                    ReportError(E->Line, "'len' expects exactly 1 argument, got %zu", E->As.Call.ArgCount);
+                    for (size_t i = 0; i < E->As.Call.ArgCount; i++)
+                        CheckExpr(C, E->As.Call.Args[i]);
+                    Result = MakeType(C, TY_LONG);
+                    break;
+                }
+
+                PRIN_TYPE ArgType = CheckExpr(C, E->As.Call.Args[0]);
+                if (ArgType->Kind != TY_ARRAY)
+                    ReportError(E->Line, "'len' expects an array or slice, got '%s'", TypeName(ArgType));
+
+                E->As.Call.IsLenBuiltin = 1;
+                Result = MakeType(C, TY_LONG);
+                break;
+            }
+
             if (IsFmtOrPrintName(E->As.Call.Name, E->As.Call.Length))
             {
                 Result = CheckFmtCall(C, E);
@@ -635,7 +744,8 @@ CheckExpr(PCHECKER C, PRIN_EXPR E)
             {
                 PRIN_TYPE ArgType = CheckExpr(C, E->As.Call.Args[i]);
                 if (!TypesEqual(ArgType, Sig->Params[i].Type) &&
-                    !CoerceLiteralTo(E->As.Call.Args[i], Sig->Params[i].Type))
+                    !CoerceLiteralTo(E->As.Call.Args[i], Sig->Params[i].Type) &&
+                    !ArrayCoercesToSlice(ArgType, Sig->Params[i].Type))
                 {
                     ReportError(E->Line, "argument %zu of '%.*s' expects '%s', got '%s'",
                                 i + 1, (int)E->As.Call.Length, E->As.Call.Name,
@@ -675,6 +785,29 @@ CheckBlock(PCHECKER C, PRIN_STMT Block, int NewScope)
 }
 
 static void
+CheckArrayLitAgainst(PCHECKER C, PRIN_EXPR E, PRIN_TYPE DeclType)
+{
+    if (E->As.ArrayLit.Count != DeclType->Length)
+    {
+        ReportError(E->Line, "array literal has %zu element(s), expected %zu",
+                    E->As.ArrayLit.Count, DeclType->Length);
+    }
+
+    for (size_t i = 0; i < E->As.ArrayLit.Count; i++)
+    {
+        PRIN_EXPR El = E->As.ArrayLit.Elements[i];
+        PRIN_TYPE ElType = CheckExpr(C, El);
+        if (!TypesEqual(ElType, DeclType->ElementType) && !CoerceLiteralTo(El, DeclType->ElementType))
+        {
+            ReportError(El->Line, "array element %zu has type '%s', expected '%s'",
+                        i + 1, TypeName(ElType), TypeName(DeclType->ElementType));
+        }
+    }
+
+    E->ResolvedType = DeclType;
+}
+
+static void
 CheckStmt(PCHECKER C, PRIN_STMT S)
 {
     switch (S->Kind)
@@ -686,12 +819,20 @@ CheckStmt(PCHECKER C, PRIN_STMT S)
 
             if (S->As.VarDecl.Init)
             {
-                PRIN_TYPE InitType = CheckExpr(C, S->As.VarDecl.Init);
-                if (!TypesEqual(DeclType, InitType) && !CoerceLiteralTo(S->As.VarDecl.Init, DeclType))
+                if (DeclType->Kind == TY_ARRAY && !DeclType->IsSlice &&
+                    S->As.VarDecl.Init->Kind == EXPR_ARRAY_LIT)
                 {
-                    ReportError(S->Line, "cannot initialize '%.*s' of type '%s' with '%s'",
-                                (int)S->As.VarDecl.Length, S->As.VarDecl.Name,
-                                TypeName(DeclType), TypeName(InitType));
+                    CheckArrayLitAgainst(C, S->As.VarDecl.Init, DeclType);
+                }
+                else
+                {
+                    PRIN_TYPE InitType = CheckExpr(C, S->As.VarDecl.Init);
+                    if (!TypesEqual(DeclType, InitType) && !CoerceLiteralTo(S->As.VarDecl.Init, DeclType))
+                    {
+                        ReportError(S->Line, "cannot initialize '%.*s' of type '%s' with '%s'",
+                                    (int)S->As.VarDecl.Length, S->As.VarDecl.Name,
+                                    TypeName(DeclType), TypeName(InitType));
+                    }
                 }
             }
 
@@ -809,6 +950,9 @@ TypecheckModule(PRIN_MODULE Module, PARENA Arena)
 
         if (IsFmtOrPrintName(Fn->Name, Fn->Length))
             ReportError(Fn->Line, "cannot redefine builtin '%.*s'", (int)Fn->Length, Fn->Name);
+
+        if (Fn->ReturnType->Kind == TY_ARRAY)
+            ReportError(Fn->Line, "functions cannot return arrays or slices yet");
 
         C.Funcs[i].Name = Fn->Name;
         C.Funcs[i].Length = Fn->Length;

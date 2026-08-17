@@ -43,6 +43,7 @@ BaseType(PRIN_TYPE T)
         case TY_LONG:
         case TY_U64:
         case TY_POINTER:
+        case TY_ARRAY:
             return 'l';
         case TY_FLOAT:
             return 's';
@@ -74,6 +75,7 @@ TypeWidth(PRIN_TYPE T)
         case TY_I16: case TY_U16: return 2;
         case TY_FLOAT: return 4;
         case TY_LONG: case TY_U64: case TY_POINTER: return 8;
+        case TY_ARRAY: return T->IsSlice ? 8 : TypeWidth(T->ElementType) * (int)T->Length;
         default: return 4; /* int, u32 */
     }
 }
@@ -81,6 +83,8 @@ TypeWidth(PRIN_TYPE T)
 static int
 TypeAlign(PRIN_TYPE T)
 {
+    if (T->Kind == TY_ARRAY && !T->IsSlice)
+        return TypeAlign(T->ElementType);
     return TypeWidth(T) > 4 ? 8 : 4;
 }
 
@@ -158,6 +162,27 @@ WidenTo(PGEN G, int Temp, PRIN_TYPE FromType, PRIN_TYPE ToType)
     }
 
     return Temp;
+}
+
+static RIN_TYPE GLongType = { TY_LONG, NULL, NULL, 0, 0 };
+
+static int NamesEqual(const char *A, size_t ALen, const char *B, size_t BLen);
+static int GenExpr(PGEN G, PRIN_EXPR E);
+
+static int
+GenIndexAddr(PGEN G, PRIN_EXPR E)
+{
+    int Base = GenExpr(G, E->As.Index.Array);
+    int Idx = GenExpr(G, E->As.Index.Index);
+    Idx = WidenTo(G, Idx, E->As.Index.Index->ResolvedType, &GLongType);
+
+    int Width = TypeWidth(E->ResolvedType);
+    int Off = NewTemp(G);
+    fprintf(G->Out, "    %%t%d =l mul %%t%d, %d\n", Off, Idx, Width);
+
+    int Addr = NewTemp(G);
+    fprintf(G->Out, "    %%t%d =l add %%t%d, %%t%d\n", Addr, Base, Off);
+    return Addr;
 }
 
 static int
@@ -485,6 +510,11 @@ GenLValueAddr(PGEN G, PRIN_EXPR E)
         return GenExpr(G, E->As.Unary.Operand);
     }
 
+    if (E->Kind == EXPR_INDEX)
+    {
+        return GenIndexAddr(G, E);
+    }
+
     ReportError(E->Line, "internal codegen error: invalid lvalue");
     return NewTemp(G);
 }
@@ -542,6 +572,37 @@ CmpOpName(BINARY_OP Op, char Base, int Unsigned)
     return Buf;
 }
 
+static char *
+SliceLenName(const char *Name, size_t Length)
+{
+    char *Buf = malloc(Length + 6);
+    memcpy(Buf, Name, Length);
+    memcpy(Buf + Length, "__len", 6); /* includes the trailing NUL */
+    return Buf;
+}
+
+static int
+GenLenCall(PGEN G, PRIN_EXPR E)
+{
+    PRIN_EXPR ArgExpr = E->As.Call.Args[0];
+    PRIN_TYPE ArgType = ArgExpr->ResolvedType;
+    int T = NewTemp(G);
+
+    if (ArgType->IsSlice)
+    {
+        char *LenName = SliceLenName(ArgExpr->As.Ident.Name, ArgExpr->As.Ident.Length);
+        PVAR V = FindVar(G, LenName, strlen(LenName));
+        free(LenName);
+        fprintf(G->Out, "    %%t%d =l loadl %%t%d\n", T, V->SlotId);
+    }
+    else
+    {
+        fprintf(G->Out, "    %%t%d =l copy %zu\n", T, ArgType->Length);
+    }
+
+    return T;
+}
+
 static int
 GenExpr(PGEN G, PRIN_EXPR E)
 {
@@ -587,6 +648,8 @@ GenExpr(PGEN G, PRIN_EXPR E)
         case EXPR_IDENT:
         {
             PVAR V = FindVar(G, E->As.Ident.Name, E->As.Ident.Length);
+            if (V->Type->Kind == TY_ARRAY && !V->Type->IsSlice)
+                return V->SlotId;
             int T = NewTemp(G);
             fprintf(G->Out, "    %%t%d =%c %s %%t%d\n", T, Base, LoadOp(V->Type), V->SlotId);
             return T;
@@ -674,10 +737,20 @@ GenExpr(PGEN G, PRIN_EXPR E)
             return Value;
         }
 
+        case EXPR_INDEX:
+        {
+            int Addr = GenIndexAddr(G, E);
+            int T = NewTemp(G);
+            fprintf(G->Out, "    %%t%d =%c %s %%t%d\n", T, Base, LoadOp(E->ResolvedType), Addr);
+            return T;
+        }
+
         case EXPR_CALL:
         {
             if (E->As.Call.IsFmtBuiltin)
                 return GenFmtCall(G, E);
+            if (E->As.Call.IsLenBuiltin)
+                return GenLenCall(G, E);
 
             int *ArgTemps = malloc(E->As.Call.ArgCount * sizeof(int));
             for (size_t i = 0; i < E->As.Call.ArgCount; i++)
@@ -698,22 +771,41 @@ GenExpr(PGEN G, PRIN_EXPR E)
             }
 
             size_t FixedCount = Callee ? Callee->ParamCount : E->As.Call.ArgCount;
+            int Printed = 0;
             for (size_t i = 0; i < E->As.Call.ArgCount; i++)
             {
                 if (Callee && Callee->IsVariadic && i == FixedCount)
-                    fprintf(G->Out, "%s...", i == 0 ? "" : ", ");
+                {
+                    fprintf(G->Out, "%s...", Printed == 0 ? "" : ", ");
+                    Printed = 1;
+                }
 
-                char ArgBase = BaseType(E->As.Call.Args[i]->ResolvedType);
-                fprintf(G->Out, "%s%c %%t%d", i == 0 ? "" : ", ", ArgBase, ArgTemps[i]);
+                PRIN_TYPE ArgType = E->As.Call.Args[i]->ResolvedType;
+                PRIN_TYPE ParamType = (Callee && i < Callee->ParamCount) ? Callee->Params[i].Type : NULL;
+
+                if (ParamType && ParamType->Kind == TY_ARRAY && ParamType->IsSlice &&
+                    ArgType->Kind == TY_ARRAY && !ArgType->IsSlice)
+                {
+                    fprintf(G->Out, "%sl %%t%d, l %zu", Printed == 0 ? "" : ", ", ArgTemps[i], ArgType->Length);
+                }
+                else
+                {
+                    char ArgBase = BaseType(ArgType);
+                    fprintf(G->Out, "%s%c %%t%d", Printed == 0 ? "" : ", ", ArgBase, ArgTemps[i]);
+                }
+                Printed = 1;
             }
             /* if the call passed no variadic args at all, the '...' marker still needs to be there */
             if (Callee && Callee->IsVariadic && E->As.Call.ArgCount == FixedCount)
-                fprintf(G->Out, "%s...", FixedCount == 0 ? "" : ", ");
+                fprintf(G->Out, "%s...", Printed == 0 ? "" : ", ");
             fprintf(G->Out, ")\n");
 
             free(ArgTemps);
             return T >= 0 ? T : NewTemp(G); /* dummy temp for void calls used in expr position (shouldn't happen post-typecheck) */
         }
+
+        case EXPR_ARRAY_LIT:
+            break;
     }
 
     return NewTemp(G);
@@ -739,8 +831,27 @@ GenStmt(PGEN G, PRIN_STMT S)
             PVAR V = DeclareVar(G, S->As.VarDecl.Name, S->As.VarDecl.Length, S->As.VarDecl.Type);
             if (S->As.VarDecl.Init)
             {
-                int Val = GenExpr(G, S->As.VarDecl.Init);
-                fprintf(G->Out, "    %s %%t%d, %%t%d\n", StoreOp(S->As.VarDecl.Type), Val, V->SlotId);
+                if (S->As.VarDecl.Type->Kind == TY_ARRAY && S->As.VarDecl.Init->Kind == EXPR_ARRAY_LIT)
+                {
+                    PRIN_TYPE ElemType = S->As.VarDecl.Type->ElementType;
+                    int ElemWidth = TypeWidth(ElemType);
+                    for (size_t i = 0; i < S->As.VarDecl.Init->As.ArrayLit.Count; i++)
+                    {
+                        int Val = GenExpr(G, S->As.VarDecl.Init->As.ArrayLit.Elements[i]);
+                        int Addr = V->SlotId;
+                        if (i > 0)
+                        {
+                            Addr = NewTemp(G);
+                            fprintf(G->Out, "    %%t%d =l add %%t%d, %d\n", Addr, V->SlotId, (int)i * ElemWidth);
+                        }
+                        fprintf(G->Out, "    %s %%t%d, %%t%d\n", StoreOp(ElemType), Val, Addr);
+                    }
+                }
+                else
+                {
+                    int Val = GenExpr(G, S->As.VarDecl.Init);
+                    fprintf(G->Out, "    %s %%t%d, %%t%d\n", StoreOp(S->As.VarDecl.Type), Val, V->SlotId);
+                }
             }
             break;
         }
@@ -865,19 +976,59 @@ GenFunction(PGEN G, RIN_FUNCTION *Fn)
         fprintf(G->Out, "%c ", RetBase);
     fprintf(G->Out, "$%.*s(", (int)Fn->Length, Fn->Name);
 
-    int *ParamTemps = malloc(Fn->ParamCount * sizeof(int));
+    int *ParamTemps = malloc(Fn->ParamCount * 2 * sizeof(int));
+    int TempIdx = 0;
+    int Printed = 0;
     for (size_t i = 0; i < Fn->ParamCount; i++)
     {
-        ParamTemps[i] = NewTemp(G);
-        char PBase = BaseType(Fn->Params[i].Type);
-        fprintf(G->Out, "%s%c %%t%d", i == 0 ? "" : ", ", PBase, ParamTemps[i]);
+        PRIN_TYPE PType = Fn->Params[i].Type;
+        if (PType->Kind == TY_ARRAY && PType->IsSlice)
+        {
+            int PtrT = NewTemp(G);
+            int LenT = NewTemp(G);
+            ParamTemps[TempIdx++] = PtrT;
+            ParamTemps[TempIdx++] = LenT;
+            fprintf(G->Out, "%sl %%t%d, l %%t%d", Printed ? ", " : "", PtrT, LenT);
+        }
+        else
+        {
+            int T = NewTemp(G);
+            ParamTemps[TempIdx++] = T;
+            fprintf(G->Out, "%s%c %%t%d", Printed ? ", " : "", BaseType(PType), T);
+        }
+        Printed = 1;
     }
     fprintf(G->Out, ") {\n@start\n");
 
+    TempIdx = 0;
     for (size_t i = 0; i < Fn->ParamCount; i++)
     {
-        PVAR V = DeclareVar(G, Fn->Params[i].Name, Fn->Params[i].Length, Fn->Params[i].Type);
-        fprintf(G->Out, "    %s %%t%d, %%t%d\n", StoreOp(Fn->Params[i].Type), ParamTemps[i], V->SlotId);
+        PRIN_TYPE PType = Fn->Params[i].Type;
+        if (PType->Kind == TY_ARRAY && PType->IsSlice)
+        {
+            int PtrT = ParamTemps[TempIdx++];
+            int LenT = ParamTemps[TempIdx++];
+
+            PRIN_TYPE PtrType = malloc(sizeof(RIN_TYPE));
+            PtrType->Kind = TY_POINTER;
+            PtrType->PointeeType = PType->ElementType;
+            PtrType->ElementType = NULL;
+            PtrType->Length = 0;
+            PtrType->IsSlice = 0;
+
+            PVAR PtrVar = DeclareVar(G, Fn->Params[i].Name, Fn->Params[i].Length, PtrType);
+            fprintf(G->Out, "    storel %%t%d, %%t%d\n", PtrT, PtrVar->SlotId);
+
+            char *LenName = SliceLenName(Fn->Params[i].Name, Fn->Params[i].Length);
+            PVAR LenVar = DeclareVar(G, LenName, strlen(LenName), &GLongType);
+            fprintf(G->Out, "    storel %%t%d, %%t%d\n", LenT, LenVar->SlotId);
+        }
+        else
+        {
+            int T = ParamTemps[TempIdx++];
+            PVAR V = DeclareVar(G, Fn->Params[i].Name, Fn->Params[i].Length, PType);
+            fprintf(G->Out, "    %s %%t%d, %%t%d\n", StoreOp(PType), T, V->SlotId);
+        }
     }
     free(ParamTemps);
 

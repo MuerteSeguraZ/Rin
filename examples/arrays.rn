@@ -1,0 +1,46 @@
+rite sum(xs int[]) long
+{
+    mut total long = 0;
+    mut i int = 0;
+    while (i < len(xs))
+    {
+        total = total + xs[i];
+        i = i + 1;
+    }
+    ret total;
+}
+
+rite bump(xs int[]) void
+{
+    mut i int = 0;
+    while (i < len(xs))
+    {
+        xs[i] = xs[i] + 1;
+        i = i + 1;
+    }
+}
+
+rite main() int
+{
+    let nums int[5] = [1, 2, 3, 4, 5];
+    print("len=%d\n", len(nums));
+    print("nums[0]=%d nums[4]=%d\n", nums[0], nums[4]);
+    print("sum=%d\n", sum(nums));
+
+    mut squares int[4] = [0, 0, 0, 0];
+    mut i int = 0;
+    while (i < 4)
+    {
+        squares[i] = i * i;
+        i = i + 1;
+    }
+    print("squares: %d %d %d %d\n", squares[0], squares[1], squares[2], squares[3]);
+
+    bump(squares);
+    print("bumped: %d %d %d %d\n", squares[0], squares[1], squares[2], squares[3]);
+
+    let bytes u8[3] = [10, 200, 255];
+    print("bytes[1]=%d bytes[2]=%d\n", bytes[1], bytes[2]);
+
+    ret 0;
+}
